@@ -1,0 +1,280 @@
+import json
+import os
+import chromadb
+import jieba
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage
+from rank_bm25 import BM25Okapi
+from llm import get_chat_model, get_embed_model
+from total_prompts import ANSWER_PROMPT, RERANK_PROMPT
+
+# 路径
+# 本文件在 src/ 下，所以 BASE_DIR 要取上一级才是项目根目录
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CASES_FILE = os.path.join(BASE_DIR, "data", "risk_cases", "cases.json")   # 案例库
+VECTOR_DB_DIR = os.path.join(BASE_DIR, "data", "chroma_db")                # 向量库
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))  # 读 .env 里的 API Key
+
+
+# 精排分门槛：大模型精排分低于这个值的案例不返回（宁缺毋滥）。
+# 对应 RERANK_PROMPT 的评分标准：6-8 比较相关，3-5 弱相关，0-2 不相关。
+MIN_FINAL_SCORE = 6.0
+
+
+# 读案例库 
+
+def load_cases() -> list[dict]:
+    """从 json 文件读入全部历史案例，返回一个列表。"""
+    with open(CASES_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def make_case_text(case: dict) -> str:
+    """把一条案例拼成一段可检索的文本。
+
+    关键词故意写两遍，是为了在「关键词检索」里给关键词更高权重，
+    这样搜关键词时这条案例更容易排前面。
+    """
+    title = case["title"]
+    risk_type = case["risk_type"]
+    keywords = " ".join(case["keywords"])          # 关键词用空格连起来
+    clause = case["clause_text"]                   # 条款原文
+    return f"{title} {risk_type} {keywords} {keywords} {clause}"
+
+# 索引：只建一次，用全局变量记住（None 表示还没建）
+
+_cases = None          # 全部案例
+_by_id = None          # id → 案例，方便按 id 查
+_bm25 = None           # 关键词索引（第一层用）
+_embed_model = None    # 向量模型
+_collection = None     # 向量库（第二层用）
+_rerank_llm = None     # 精排用的大模型
+_answer_llm = None     # 生成结论用的大模型
+
+
+def _ensure_ready():
+    """确保索引都建好了。第一次调用才真正建，之后直接复用。"""
+    global _cases, _by_id, _bm25, _embed_model, _collection, _rerank_llm, _answer_llm
+
+    if _bm25 is not None:
+        return   # 已经建过，跳过
+
+    print("初始化检索...")
+    _cases = load_cases()
+    _by_id = {c["id"]: c for c in _cases}
+    _embed_model = get_embed_model()
+    _rerank_llm = get_chat_model(temperature=0.0)   # 打分要稳定，温度 0
+    _answer_llm = get_chat_model(temperature=0.3)   # 写结论，温度稍高更自然
+
+    # 建关键词索引：15 条案例先分词
+    docs = [jieba.lcut(make_case_text(c)) for c in _cases]
+    _bm25 = BM25Okapi(docs)
+
+    # 建/加载 向量库
+    _collection = _get_collection()
+
+    print("检索就绪。\n")
+
+
+def init_rag():
+    """程序启动时调用一次：提前加载案例、建好关键词索引和向量库。
+
+    这样用户输入后直接检索，不用再等第一次建库。
+    幂等，重复调用也不会重复建（内部有判断）。
+    """
+    _ensure_ready()
+
+
+def _get_collection():
+    """拿到向量库。已经存在就直接加载，不存在才向量化（只做一次）。"""
+    client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+
+    # 先看看向量库是不是已经建好了
+    try:
+        collection = client.get_collection("cases")
+
+        if collection.count() == len(_cases):   # 数量对得上，说明是最新的
+            print("检测到已存在的向量库，直接加载（不重复向量化）")
+            return collection
+        # 数量对不上（案例库改过），删掉重建
+        else:
+            client.delete_collection("cases")
+
+    except Exception:
+        pass   # 没找到，说明还没建过，走下面新建
+
+    # 走到这里说明要新建：把 15 条案例逐条向量化
+    collection = client.create_collection(name="cases")
+
+    print(f"向量库不存在，正在向量化 {len(_cases)} 条案例...")
+    for c in _cases:
+        vec = _embed_model.embed_query(make_case_text(c))
+        collection.add(
+            ids=[c["id"]],
+            embeddings=[vec],
+            metadatas=[{"title": c["title"], "risk_type": c["risk_type"]}],
+        )
+    print("向量化完成。")
+    return collection
+
+# RAG 三层检索（全是函数）
+
+def keyword_search(query: str, top_k: int = 3) -> list[dict]:
+    """① 第一层：关键词检索，认「字面」。
+
+    把查询切词，去每个案例里数这些词出现多少次，出现越多分越高。
+    返回最像的 top_k 条案例，每条带 keyword_score。
+    """
+    _ensure_ready()
+
+    words = jieba.lcut(query)               # 查询先分词
+    scores = _bm25.get_scores(words)        # 每个案例得一个分
+
+    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+
+    result = []
+    for i, score in ranked[:top_k]:
+        if score <= 0:          # 0 分 = 一个词都没匹配上，跳过
+            continue
+        c = _cases[i].copy()
+        c["keyword_score"] = round(score, 4)
+        result.append(c)
+    return result
+
+
+def semantic_search(query: str, top_k: int = 3) -> list[dict]:
+    """② 第二层：语义检索，认「意思」。
+
+    把查询变成向量，去向量库里找距离最近的（距离越小越像）。
+    返回最像的 top_k 条案例，每条带 semantic_score（0~1，越大越像）。
+    """
+    _ensure_ready()
+
+    query_vec = _embed_model.embed_query(query)   # 查询 → 向量
+    res = _collection.query(query_embeddings=[query_vec], n_results=top_k)
+
+    ids = res["ids"][0]          # 命中的案例 id
+    dists = res["distances"][0]  # 对应的距离（越小越像）
+
+    result = []
+    for cid, dist in zip(ids, dists):
+        c = _by_id[cid].copy()
+        c["semantic_score"] = round(1.0 - dist, 4)   # 距离越小 → 相似度越高
+        result.append(c)
+    return result
+
+
+def merge_rankings(list_of_results):
+    """③ 第三层前半：合并排名。
+
+    把关键词、向量两路的结果，合成一个总排名。
+    规则：
+    - 不看两路各自的原始分数（关键词分和向量分数值不一样，没法比）
+    - 只看「名次」：第1名加 1/61 分，第2名加 1/62 分……名次越靠前加得越多
+    - 同一个案例两路都出现，分就叠加，所以两路都靠前的案例总分最高
+    返回 {案例id: 合并分}，分越高代表越该排前面。
+    """
+    k = 60
+    total = {}                        # 案例id -> 合并分
+
+    for one_road in list_of_results:  # 关键词一路、向量一路，各走一遍
+        rank = 1                      # 名次，从第1名开始
+        for case in one_road:         # 这一路里逐条看（已经是按分数排好序的）
+            cid = case["id"]
+            if cid not in total:      # 这个案例第一次出现，先记 0 分
+                total[cid] = 0
+            total[cid] += 1.0 / (k + rank)   # 按名次加分
+            rank += 1                 # 名次往后挪
+
+    return total
+
+
+def rerank(query: str, candidates: list[dict]) -> list[dict]:
+    """③ 第三层后半：精排。让大模型给候选案例打分，排出最终顺序。"""
+    _ensure_ready()
+
+    if len(candidates) <= 1:        # 只有一个候选，没排序意义
+        for c in candidates:
+            c["final_score"] = None   # 未打分，交给 rag_search 直接返回
+        return candidates
+
+    # 把候选整理成清单给大模型看
+    lines = [f"  [{c['id']}] {c['title']}（{c['risk_type']}）" for c in candidates]
+    user = f"查询：{query}\n\n候选案例：\n" + "\n".join(lines) + "\n\n请对每个候选案例打分。"
+
+    ans = _rerank_llm.invoke([
+        SystemMessage(content=RERANK_PROMPT),
+        HumanMessage(content=user),
+    ])
+    content = ans.content.strip()
+
+    # 大模型偶尔把 JSON 包在 ``` 里，先剥掉
+    if content.startswith("```"):
+        content = content.strip("`")
+
+    try:
+        score_map = {item["id"]: item["score"] for item in json.loads(content)}
+    except (json.JSONDecodeError, KeyError, TypeError):
+        # 解析失败：标记未打分，退回按合并分排序（门槛过滤会跳过）
+        for c in candidates:
+            c["final_score"] = None
+        candidates.sort(key=lambda c: c["merged_score"], reverse=True)
+        return candidates
+
+    for c in candidates:
+        c["final_score"] = score_map.get(c["id"], 0.0)
+    candidates.sort(key=lambda c: c["final_score"], reverse=True)
+    return candidates
+
+
+def rag_search(query: str, top_k: int = 3) -> list[dict]:
+    """RAG 三层检索：关键词 → 语义 → 合并精排，一步走完，返回最终案例列表。
+
+    这就是给「检索节点」调用的那个 function。
+    """
+    _ensure_ready()
+
+    # 第 1、2 层：两路各自召回，各取前 5
+    by_keyword = keyword_search(query, top_k=5)
+    by_semantic = semantic_search(query, top_k=5)
+
+    # 第 3 层前半：合并两路排名
+    merged = merge_rankings([by_keyword, by_semantic])
+    ranked_ids = sorted(merged, key=lambda cid: merged[cid], reverse=True)
+
+    candidates = []
+    for cid in ranked_ids:
+        c = _by_id[cid].copy()
+        c["merged_score"] = round(merged[cid], 6)
+        candidates.append(c)
+
+    # 第 3 层后半：大模型精排
+    candidates = rerank(query, candidates)
+
+    # 门槛过滤：精排成功后，把弱相关/不相关（分低于门槛）的踢掉，宁缺毋滥
+    if candidates and all(c.get("final_score") is not None for c in candidates):
+        candidates = [c for c in candidates if c["final_score"] >= MIN_FINAL_SCORE]
+
+    return candidates[:top_k]
+
+
+def generate_answer(query: str, cases: list[dict]) -> str:
+    """最后一步（RAG 的 G）：拿「问题 + 检索到的案例」让大模型写结论。"""
+    _ensure_ready()
+
+    parts = []
+    for c in cases:
+        parts.append(
+            f"[{c['id']}] {c['title']}（{c['risk_type']}）\n"
+            f"  分析：{c['analysis']}\n"
+            f"  建议：{c['suggestion']}"
+        )
+    case_text = "\n".join(parts)
+
+    user = f"用户描述：{query}\n\n历史相似案例：\n{case_text}"
+    resp = _answer_llm.invoke([
+        SystemMessage(content=ANSWER_PROMPT),
+        HumanMessage(content=user),
+    ])
+    return resp.content.strip()
