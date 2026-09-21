@@ -1,16 +1,3 @@
-# ============================================================
-# api.py —— FastAPI 接口（后端 + 一个简单前端页面）
-#
-# 运行（任选其一）：
-#   方式一： cd src && ..\venv\Scripts\uvicorn api:app --reload --port 8000
-#   方式二： 在项目根目录执行  venv\Scripts\uvicorn src.api:app --reload --port 8000
-#   方式三： python src\api.py
-#
-# 接口 / 页面：
-#   GET  /            给普通用户看的页面（static/index.html）
-#   GET  /health      健康检查
-#   POST /chat        提交问题，返回 {question, answer, retrieved_cases}
-# ============================================================
 import json
 import os
 import sys
@@ -19,8 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from built_graph import build_graph
@@ -32,15 +18,84 @@ _graph = build_graph()   # 图编译一次，全局复用
 
 app = FastAPI(title="合同风险条款检索助手")
 
-# 前端页面目录（项目根目录下的 static）
-STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# 极简调试页：只为了能在浏览器里手动试一下 /chat，不做样式美化，也不依赖外部页面文件。
+# 渲染一律用 textContent 填内容，不拼 HTML 字符串 —— 大模型的输出不会被当成 HTML 执行。
+PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>合同风险条款检索助手</title>
+</head>
+<body>
+<h3>合同风险条款检索助手</h3>
+<textarea id="q" rows="3" cols="60" placeholder="例如：乙方要我们承担无限赔偿责任"></textarea>
+<br>
+<button id="go">分析风险</button>
+<span id="status"></span>
+<div id="out"></div>
+<script>
+var out = document.getElementById('out');
+var status = document.getElementById('status');
+var q = document.getElementById('q');
+
+function line(text, bold) {
+  var d = document.createElement('div');
+  d.textContent = text;
+  if (bold) { d.style.fontWeight = 'bold'; }
+  return d;
+}
+
+function render(data) {
+  out.innerHTML = '';                        // 清空上一次的结果
+  var pre = document.createElement('pre');   // pre 保留大模型输出的换行
+  pre.textContent = data.answer || '（无结果）';
+  out.appendChild(pre);
+
+  out.appendChild(line('参考案例：', true));
+  var cases = data.retrieved_cases || [];
+  if (!cases.length) {
+    out.appendChild(line('案例库中没有找到相近的案例，上面的回答是通用建议。'));
+    return;
+  }
+  cases.forEach(function (c) {
+    var score = (c.final_score === null || c.final_score === undefined) ? '' : '  相关度 ' + c.final_score + '/10';
+    out.appendChild(line('[' + c.id + '] ' + c.title + '（' + c.risk_type + ' / ' + c.risk_level + '）' + score, true));
+    out.appendChild(line('分析：' + c.analysis));
+    out.appendChild(line('建议：' + c.suggestion));
+  });
+}
+
+document.getElementById('go').onclick = function () {
+  var text = q.value.trim();
+  if (!text) { q.focus(); return; }
+
+  status.textContent = '检索分析中...';
+  fetch('/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question: text })
+  }).then(function (resp) {
+    if (!resp.ok) { throw new Error('服务返回错误：' + resp.status); }
+    return resp.json();
+  }).then(function (data) {
+    status.textContent = '';
+    render(data);
+  }).catch(function (e) {
+    status.textContent = '';
+    out.innerHTML = '';
+    out.appendChild(line('出错了：' + e.message));
+  });
+};
+</script>
+</body>
+</html>"""
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def index():
-    """返回给普通用户看的页面。"""
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    """返回内置的极简调试页面。"""
+    return PAGE
 
 
 @app.get("/health")

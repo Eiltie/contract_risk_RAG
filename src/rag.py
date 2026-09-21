@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from rank_bm25 import BM25Okapi
 from llm import get_chat_model, get_embed_model
-from total_prompts import ANSWER_PROMPT, RERANK_PROMPT
+from total_prompts import ANSWER_PROMPT, NO_HIT_PROMPT, RERANK_PROMPT
 
 # 路径
 # 本文件在 src/ 下，所以 BASE_DIR 要取上一级才是项目根目录
@@ -20,6 +20,12 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))  # 读 .env 里的 API Key
 # 精排分门槛：大模型精排分低于这个值的案例不返回（宁缺毋滥）。
 # 对应 RERANK_PROMPT 的评分标准：6-8 比较相关，3-5 弱相关，0-2 不相关。
 MIN_FINAL_SCORE = 6.0
+
+# 每一路（关键词/语义）各召回多少条候选，交给精排去挑。
+# 为什么不止取三五条：用户说大白话时，正确答案经常排得很靠后
+# （实测 15 条口语化难例题里，9 条的正确答案在 5 名开外），召回太少精排根本见不到它。
+# 实测 10 条的性价比最高：K=5 只能覆盖 6/15 条，K=10 覆盖 11/15，再往上收益就很小了。
+RECALL_K = 10
 
 
 # 读案例库 
@@ -67,7 +73,7 @@ def _ensure_ready():
     _rerank_llm = get_chat_model(temperature=0.0)   # 打分要稳定，温度 0
     _answer_llm = get_chat_model(temperature=0.3)   # 写结论，温度稍高更自然
 
-    # 建关键词索引：15 条案例先分词
+    # 建关键词索引：把每条案例先分词，再交给 BM25 统计词频
     docs = [jieba.lcut(make_case_text(c)) for c in _cases]
     _bm25 = BM25Okapi(docs)
 
@@ -104,7 +110,7 @@ def _get_collection():
     except Exception:
         pass   # 没找到，说明还没建过，走下面新建
 
-    # 走到这里说明要新建：把 15 条案例逐条向量化
+    # 走到这里说明要新建：把每条案例逐条向量化（条数跟着案例库走，别写死）
     collection = client.create_collection(name="cases")
 
     print(f"向量库不存在，正在向量化 {len(_cases)} 条案例...")
@@ -235,9 +241,9 @@ def rag_search(query: str, top_k: int = 3) -> list[dict]:
     """
     _ensure_ready()
 
-    # 第 1、2 层：两路各自召回，各取前 5
-    by_keyword = keyword_search(query, top_k=5)
-    by_semantic = semantic_search(query, top_k=5)
+    # 第 1、2 层：两路各自召回（各取前 RECALL_K 条，候选池大一些，精排才有得挑）
+    by_keyword = keyword_search(query, top_k=RECALL_K)
+    by_semantic = semantic_search(query, top_k=RECALL_K)
 
     # 第 3 层前半：合并两路排名
     merged = merge_rankings([by_keyword, by_semantic])
@@ -260,13 +266,30 @@ def rag_search(query: str, top_k: int = 3) -> list[dict]:
 
 
 def generate_answer(query: str, cases: list[dict]) -> str:
-    """最后一步（RAG 的 G）：拿「问题 + 检索到的案例」让大模型写结论。"""
+    """最后一步（RAG 的 G）：拿「问题 + 检索到的案例」让大模型写结论。
+
+    分两种走法：
+    - 检索到了案例：把案例（连精排分一起）交给大模型，让它总结成三段结论；
+    - 一条都没检索到：换 NO_HIT_PROMPT，要求它如实说"没有案例依据"，
+      只给不依赖案例库的通用建议 —— 不然它会用自己脑子里的知识硬凑一段"案例依据"出来。
+    """
     _ensure_ready()
+
+    # 无命中：案例库覆盖不到这个问题，宁可说没有，也不能装作有依据
+    if not cases:
+        resp = _answer_llm.invoke([
+            SystemMessage(content=NO_HIT_PROMPT),
+            HumanMessage(content=f"用户描述：{query}"),
+        ])
+        return resp.content.strip()
 
     parts = []
     for c in cases:
+        score = c.get("final_score")
+        # 把精排分一起给大模型看，它才知道这条依据有多硬
+        score_text = f"，相关度 {score}/10" if score is not None else ""
         parts.append(
-            f"[{c['id']}] {c['title']}（{c['risk_type']}）\n"
+            f"[{c['id']}] {c['title']}（{c['risk_type']}{score_text}）\n"
             f"  分析：{c['analysis']}\n"
             f"  建议：{c['suggestion']}"
         )

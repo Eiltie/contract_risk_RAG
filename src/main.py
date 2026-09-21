@@ -33,8 +33,13 @@ def run():
         print("\n【检索节点】找到的案例")
         cases = json.loads(result["retrieved_cases"])
 
+        if not cases:
+            print("  （案例库中没有找到相近的案例，下面的回答是通用建议）")
+
         for i, c in enumerate(cases, 1):
-            print(f"  {i}. {c['title']}（{c['id']}）")
+            score = c.get("final_score")
+            score_text = f"  相关度 {score}/10" if score is not None else ""
+            print(f"  {i}. {c['title']}（{c['id']}）{score_text}")
 
         # 打印生成节点给出的结论
         print("\n【生成节点】回答")

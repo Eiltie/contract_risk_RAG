@@ -2,7 +2,7 @@
 
 一个基于 **RAG（检索增强生成）+ LangGraph** 的合同风险分析助手：输入一句风险描述，系统自动完成「关键词检索 → 语义检索 → LLM 精排」三层召回，结合 40 条真实合同风险案例库，输出**风险判断、案例依据、处理建议**三段结论。
 
-提供 **CLI 命令行** 与 **Web 页面** 两种交互方式。
+提供 **CLI 命令行** 与 **Web 服务** 两种使用方式。
 
 ---
 
@@ -42,7 +42,7 @@
 - **检索**：rank-bm25（BM25）、jieba（分词）、ChromaDB（持久化向量库）
 - **模型**：DeepSeek（生成 + 精排）、智谱 embedding-3（向量化），经 LangChain 接入
 - **服务**：FastAPI + Uvicorn
-- **前端**：原生 HTML / CSS / JS
+- **页面**：不依赖任何外部页面文件；`/` 直接返回 `src/api.py` 内置的极简调试页
 
 ---
 
@@ -58,12 +58,12 @@
 │   ├── rag.py             # 三层检索 + 答案生成核心逻辑
 │   ├── llm.py             # 模型封装（DeepSeek / 智谱）
 │   ├── state.py           # 状态定义（节点间数据传递）
-│   └── total_prompts.py   # Prompt 模板（精排 / 生成）
+│   ├── total_prompts.py   # Prompt 模板（精排 / 生成）
+│   └── eval.py            # 检索质量评估（不参与线上运行，手动跑，见下文）
 ├── data/
 │   ├── risk_cases/cases.json   # 案例库（40 条）
+│   ├── eval/questions.json     # 评估集（60 道题，给 eval.py 判卷用）
 │   └── chroma_db/              # 向量库（首次运行自动生成）
-├── static/
-│   └── index.html         # Web 前端页面
 ├── requirements.txt       # 依赖
 ├── .env                   # 密钥配置（需自行填写，见下文）
 └── README.md
@@ -134,7 +134,7 @@ venv\Scripts\python src\api.py
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/` | 返回前端页面 |
+| GET | `/` | 返回内置的极简调试页面（HTML 写在 `src/api.py` 里） |
 | GET | `/health` | 健康检查，返回 `{"status": "ok"}` |
 | POST | `/chat` | 提交问题，返回答案与命中案例 |
 
@@ -186,3 +186,33 @@ venv\Scripts\python src\api.py
 | 精排温度 `0.0` | `src/rag.py` | 打分需稳定，故温度置 0 |
 | 生成温度 `0.3` | `src/rag.py` | 写结论，温度稍高更自然 |
 | RRF 参数 `k=60` | `src/rag.py`（`merge_rankings`） | 名次融合的平滑常数 |
+| 召回宽度 `RECALL_K` | `src/rag.py` | 关键词、语义两路各召回多少条候选，默认 `10` |
+
+---
+
+## 检索质量评估
+
+调参数（改召回宽度、改门槛、换 embedding 模型、往案例库里加案例）之后，别凭感觉判断好坏，跑一遍评估集看数字。
+
+```bash
+venv\Scripts\python src\eval.py
+```
+
+评估集在 `data/eval/questions.json`，共 60 道题，每题带一个 `level`：
+
+- `basic`（40 道）：用词接近条款原文，属于"好搜"的问题
+- `hard`（15 道）：纯大白话、不带专业术语，模仿真实用户随口问
+- `negative`（5 道）：案例库里故意没有对应案例，看系统会不会硬凑一条出来
+
+打印的指标：
+
+| 指标 | 含义 |
+|------|------|
+| Recall@1 | 期望案例正好排第 1 名的比例 |
+| Recall@K | 期望案例出现在返回的前 3 条里（找得到就行） |
+| MRR | 名次倒数的平均值，排第 1 得 1 分、第 2 得 0.5 分，衡量"排得好不好" |
+| 拒答正确率 | 负向题里一条都没返回的比例，衡量"会不会硬凑" |
+
+`basic` 和 `hard` 分开统计，两组的差距就是"用户换个说法会掉多少分"。
+
+> 注意：跑一次每条题都要真实调用一次 embedding + 一次精排，**是花钱的**，别频繁空跑。

@@ -11,12 +11,14 @@ def retrieve_node(state: AgentState) -> dict:
     cases = rag_search(state["question"], top_k=3)
 
     # 只保留生成结论需要的几个字段，转成 JSON 字符串存进状态
+    # final_score（精排分）也要留着：生成时要靠它判断这条依据有多硬，前端也靠它显示相关度
     simple_cases = [
         {
             "id": c["id"],
             "title": c["title"],
             "risk_type": c["risk_type"],
             "risk_level": c["risk_level"],
+            "final_score": c.get("final_score"),
             "analysis": c["analysis"],
             "suggestion": c["suggestion"],
         }
