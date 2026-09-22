@@ -12,7 +12,7 @@
 - **混合检索融合**：用 RRF（Reciprocal Rank Fusion）融合两路排名，解决「BM25 分与余弦相似度分不可直接比较」的问题。
 - **门槛过滤**：LLM 精排后按阈值丢弃弱相关/不相关案例，实现「宁缺毋滥」。
 - **双模型分工**：DeepSeek 负责精排打分与结论生成，智谱 embedding 负责文本向量化。
-- **案例库**：40 条真实(并非真实真实就违法了xd)合同风险案例，覆盖 11 类合同，每条含条款原文、风险类型、风险等级、法条依据分析、修改建议。
+- **案例库**：40 条真实合同风险案例，覆盖 12 类合同，每条含条款原文、风险类型、风险等级、法条依据分析、修改建议。
 
 ---
 
@@ -42,7 +42,8 @@
 - **检索**：rank-bm25（BM25）、jieba（分词）、ChromaDB（持久化向量库）
 - **模型**：DeepSeek（生成 + 精排）、智谱 embedding-3（向量化），经 LangChain 接入
 - **服务**：FastAPI + Uvicorn
-- **页面**：不依赖任何外部页面文件；`/` 直接返回 `src/api.py` 内置的极简调试页
+- **页面**：原生 HTML / CSS / JS（`static/`），不引入前端框架与构建工具
+- **流式输出**：`/chat/stream` 用 SSE 推送——检索一结束先把命中的案例推给前端，再逐字推生成的结论
 
 ---
 
@@ -60,6 +61,9 @@
 │   ├── state.py           # 状态定义（节点间数据传递）
 │   ├── total_prompts.py   # Prompt 模板（精排 / 生成）
 │   └── eval.py            # 检索质量评估（不参与线上运行，手动跑，见下文）
+├── static/                # 前端页面（不参与 Python 逻辑，由 api.py 以静态文件发出去）
+│   ├── page.html          # 页面结构 + 交互逻辑（JS 内联在文件末尾）
+│   └── style.css          # 样式
 ├── data/
 │   ├── risk_cases/cases.json   # 案例库（40 条）
 │   ├── eval/questions.json     # 评估集（60 道题，给 eval.py 判卷用）
@@ -119,14 +123,22 @@ cd src
 在项目根目录执行（任选其一）：
 
 ```bash
-# 方式 A：uvicorn 启动
-venv\Scripts\uvicorn src.api:app --reload --port 8000
+# 方式 A：python -m uvicorn 启动（可加 --reload，改代码后自动重启）
+venv\Scripts\python -m uvicorn src.api:app --reload --port 8000
 
-# 方式 B：直接运行
+# 方式 B：直接运行脚本
 venv\Scripts\python src\api.py
 ```
 
 浏览器打开 <http://127.0.0.1:8000>，在输入框描述风险情形，点击「分析风险」。
+
+> **⚠️ 别用 `venv\Scripts\uvicorn`**：本项目目录曾改过名，venv 里 pip 生成的那批 `.exe` 启动器
+> （`uvicorn.exe`、`pip.exe` 等共 28 个）内部把解释器路径写死了，指向改名前的旧地址，
+> 启动时会**静默失败、一个字都不报**。凡是要用这类命令，一律改成 `python -m 模块名` 的写法，
+> 比如装包用 `venv\Scripts\python -m pip install xxx`。
+
+> **端口被占用**：如果启动时报 `[Errno 10048]`，说明 8000 端口已经被别的程序占着。
+> 换个端口即可：`venv\Scripts\python -m uvicorn src.api:app --port 8001`。
 
 ---
 
@@ -134,9 +146,11 @@ venv\Scripts\python src\api.py
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/` | 返回内置的极简调试页面（HTML 写在 `src/api.py` 里） |
+| GET | `/` | 返回前端页面（`static/page.html`） |
+| GET | `/static/*` | 前端静态文件（`style.css` 等） |
 | GET | `/health` | 健康检查，返回 `{"status": "ok"}` |
-| POST | `/chat` | 提交问题，返回答案与命中案例 |
+| POST | `/chat` | 等结论写完，一次性返回答案与命中案例 |
+| POST | `/chat/stream` | 流式返回：先推案例，再逐字推结论（SSE） |
 
 `POST /chat` 请求示例：
 
@@ -150,15 +164,35 @@ venv\Scripts\python src\api.py
 {
   "question": "乙方要我们承担无限赔偿责任",
   "answer": "…（风险判断 / 案例依据 / 处理建议 三段）…",
-  "retrieved_cases": [ { "id": "C003", "title": "…", "risk_type": "…", "risk_level": "…", "analysis": "…", "suggestion": "…" } ]
+  "retrieved_cases": [ { "id": "C003", "title": "…", "risk_type": "…", "risk_level": "…", "final_score": 10, "analysis": "…", "suggestion": "…" } ]
 }
 ```
+
+### `POST /chat/stream`（流式）
+
+请求体和 `/chat` 完全一样。响应是 SSE（`text/event-stream`）：一条消息以空行结尾，
+内容是 `event: 事件名` 加上 `data: JSON`。一共有四种事件：
+
+| 事件 | data | 什么时候发 |
+|------|------|-----------|
+| `cases` | 命中的案例数组 | 检索（含精排）一结束，立刻发 |
+| `token` | 一小段文字 | 生成过程中反复发，前端按顺序拼起来就是完整结论 |
+| `done` | `{}` | 全部结束 |
+| `error` | `{"message": "…"}` | 中途出错（比如模型接口挂了） |
+
+**为什么分成两段推**：检索里的「精排」必须等大模型把整张打分表吐完，程序才能解析、
+排序、过门槛，所以这一步天生流不了，而且它是整个请求里最慢的一段（实测约 6 秒，
+占总耗时的三分之二）。既然躲不掉，就让它别白等——精排一结束先把案例推给前端，
+用户马上有东西看，而不是盯着空白干等到结论也写完。
+
+前端（`static/page.html`）用 `fetch` 读响应流并自己拆 SSE，没有用浏览器原生的
+`EventSource`——因为 `EventSource` 只支持 GET，而这里得把问题 POST 过去。
 
 ---
 
 ## 案例库说明
 
-案例库位于 `data/risk_cases/cases.json`，当前含 40 条案例，覆盖采购、销售、劳动、租赁、民间借贷、担保、买卖、建设工程、技术、居间、通用条款等 11 类合同。
+案例库位于 `data/risk_cases/cases.json`，当前含 40 条案例，覆盖劳动合同（9 条）、通用条款（4 条）以及采购、销售、服务、租赁、民间借贷、担保、买卖、建设工程、技术、居间等共 12 类合同，每类 1–3 条。
 
 每条案例字段：
 

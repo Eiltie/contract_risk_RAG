@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>合同风险条款分析助手</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="head">
+    <h1>合同风险条款分析</h1>
+    <p class="sub">用一句大白话描述你遇到的风险，系统从 40 条真实合同风险案例里找最像的，给出风险判断、案例依据和处理建议。</p>
+  </header>
+
+  <section class="ask">
+    <label for="q" hidden>风险描述</label>
+    <textarea id="q" rows="3" placeholder="例如：对方要我们承担无限赔偿责任"></textarea>
+    <div class="askbar">
+      <span class="status" id="status"></span>
+      <button id="go">分析风险</button>
+    </div>
+  </section>
+
+  <div class="examples">
+    <span class="examples-label">试试：</span>
+    <button type="button" class="chip">对方要我们承担无限赔偿责任</button>
+    <button type="button" class="chip">提前退租要赔光剩下所有租金</button>
+    <button type="button" class="chip">公司说多给补贴就不给交社保了</button>
+    <button type="button" class="chip">离职后两年不许干本行，太宽了吧</button>
+  </div>
+
+  <!-- 案例先出来（检索一结束就推），结论跟在后面逐字出现 -->
+  <section class="block" id="casesWrap" hidden>
+    <h2 class="block-title">参考案例</h2>
+    <div id="cases"></div>
+  </section>
+
+  <section class="block" id="answerWrap" hidden>
+    <div class="block-head">
+      <h2 class="block-title">分析结论</h2>
+      <button type="button" id="copy" class="copybtn">复制结论</button>
+    </div>
+    <div class="answer" id="answer"></div>
+  </section>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var q          = document.getElementById('q');
+  var go         = document.getElementById('go');
+  var statusEl   = document.getElementById('status');
+  var casesWrap  = document.getElementById('casesWrap');
+  var casesEl    = document.getElementById('cases');
+  var answerWrap = document.getElementById('answerWrap');
+  var answerEl   = document.getElementById('answer');
+  var copyBtn    = document.getElementById('copy');
+
+  var busy = false;        // 正在请求中，防重复点击
+  var answerText = '';     // 累积模型吐出来的全文
+  var renderQueued = false;
+
+  // ⚠️ 安全铁律：下面所有把文字放进页面的地方，一律用 textContent，
+  //    绝不拼 innerHTML —— 大模型的输出是外部内容，当 HTML 执行会很危险。
+
+  // ── 小工具 ──────────────────────────────────────────
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  var LEVEL_TEXT = { high: '高风险', medium: '中风险', low: '低风险' };
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  // ── 案例卡片 ────────────────────────────────────────
+
+  function buildCase(c) {
+    var card = el('article', 'case');
+
+    var head = el('div', 'case-head');
+    head.appendChild(el('span', 'case-id', c.id || ''));
+    head.appendChild(el('span', 'case-title', c.title || ''));
+
+    // 相关度 = 精排给这条案例打的分，10 分满分。
+    // 做成一小条进度条而不是光写个数字：几分的差距扫一眼就看出来了。
+    if (c.final_score !== null && c.final_score !== undefined) {
+      var high = c.final_score >= 8;
+      var wrap = el('span', 'score' + (high ? ' score-high' : ''));
+      wrap.appendChild(el('span', null, '相关度'));   // 样式从 .score 继承，不用单独写
+
+      var bar = el('span', 'score-bar');
+      var fill = el('i');
+      // 分数来自后端，这里夹一下范围再乘 10 变成百分比，防止异常值把条撑爆
+      fill.style.width = Math.max(0, Math.min(10, c.final_score)) * 10 + '%';
+      bar.appendChild(fill);
+      wrap.appendChild(bar);
+
+      wrap.appendChild(el('span', 'score-num', c.final_score + '/10'));
+      head.appendChild(wrap);
+    }
+    card.appendChild(head);
+
+    var tags = el('div', 'tags');
+    if (c.risk_type) tags.appendChild(el('span', 'tag', c.risk_type));
+    if (c.risk_level) {
+      tags.appendChild(el('span', 'tag level-' + c.risk_level,
+                          LEVEL_TEXT[c.risk_level] || c.risk_level));
+    }
+    card.appendChild(tags);
+
+    // 分析和建议折叠起来，卡片默认只占两三行
+    var det = el('details');
+    det.appendChild(el('summary', null, '查看分析与建议'));
+
+    [['分析', c.analysis], ['建议', c.suggestion]].forEach(function (pair) {
+      var p = el('p', 'case-para');
+      p.appendChild(el('strong', null, pair[0] + '：'));
+      p.appendChild(document.createTextNode(pair[1] || ''));
+      det.appendChild(p);
+    });
+    card.appendChild(det);
+
+    return card;
+  }
+
+  function showCases(cases) {
+    casesWrap.hidden = false;
+
+    if (!cases || !cases.length) {
+      // 案例库覆盖不到这个问题：如实说清楚，别让人以为下面那段有案例撑着
+      casesEl.appendChild(el('p', 'empty',
+        '案例库中没有找到相近的案例。下面的结论是通用法律建议，不是案例库的经验总结。'));
+      setStatus('未检索到相近案例，正在生成通用建议…', 'busy');
+      return;
+    }
+
+    cases.forEach(function (c) { casesEl.appendChild(buildCase(c)); });
+    setStatus('已找到 ' + cases.length + ' 条参考案例，正在生成结论…', 'busy');
+  }
+
+  // ── 结论排版 ────────────────────────────────────────
+  //
+  // 模型吐出来的是纯文本，大致长这样：
+  //   1. 风险判断：……
+  //   2. 案例依据：……
+  //   - 建议一
+  //   - 建议二
+  // 这里把它切成段落：带编号的行把「1. 风险判断：」做成小标题加粗，
+  // 以 - 或 • 开头的行做成圆点列表，其余当普通段落。
+
+  function renderAnswer() {
+    renderQueued = false;
+    answerEl.textContent = '';   // 清空重画
+
+    // 先把 markdown 的 ** 去掉（模型有时会加粗，这里统一按纯文本处理）
+    var lines = answerText.replace(/\*\*/g, '').split('\n');
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+      if (!line) continue;
+
+      // 圆点列表：- xxx / • xxx / * xxx
+      if (/^[-•*]\s+/.test(line)) {
+        answerEl.appendChild(el('p', 'bullet', line.replace(/^[-•*]\s+/, '')));
+        continue;
+      }
+
+      var p = el('p');
+      // 小标题的两种写法都要认：
+      //   「1. 风险判断：……」  加粗后面跟冒号
+      //   「一、风险判断 这属于……」  加粗后面直接跟空格（实测模型经常这么写）
+      var m = line.match(/^([一二三四五六七八九十]+、|\d+[.、])\s*([^：:\n]{2,14}?)(?:[：:]|\s|$)/);
+      if (m) {
+        // 「1.」后面补个空格再跟标题，不然中文排版挤在一起
+        var gap = m[1].slice(-1) === '.' ? ' ' : '';
+        p.appendChild(el('strong', null, m[1] + gap + m[2] + '：'));
+        p.appendChild(document.createTextNode(line.slice(m[0].length)));
+      } else {
+        p.textContent = line;
+      }
+      answerEl.appendChild(p);
+    }
+  }
+
+  // 每来一个 token 就重画一次会太频繁，用 requestAnimationFrame 合并到「每帧最多一次」
+  function scheduleRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(renderAnswer);
+  }
+
+  // ── 读流式响应 ──────────────────────────────────────
+  //
+  // 服务端按 SSE 格式发：  event: 名字\n data: JSON \n\n
+  // （一条消息以空行结尾）。网络分包是随机的，一个事件可能被切成好几块过来，
+  // 所以要先攒进 buf，凑够一个完整事件（看到空行）才处理。
+
+  function handleEvent(raw) {
+    var name = 'message';
+    var data = '';
+
+    raw.split('\n').forEach(function (line) {
+      if (line.indexOf('event:') === 0)      name = line.slice(6).trim();
+      else if (line.indexOf('data:') === 0)  data += line.slice(5).trim();
+    });
+
+    var payload;
+    try { payload = JSON.parse(data); } catch (e) { payload = null; }
+
+    if (name === 'cases') {
+      showCases(payload);
+
+    } else if (name === 'token') {
+      if (answerWrap.hidden) answerWrap.hidden = false;
+      answerText += (typeof payload === 'string' ? payload : '');
+      scheduleRender();
+
+    } else if (name === 'error') {
+      setStatus('出错了：' + ((payload && payload.message) || '未知错误'), 'error');
+    }
+    // name === 'done' 不用特别处理，收尾在下面的 finally 里
+  }
+
+  function readStream(body) {
+    var reader  = body.getReader();
+    var decoder = new TextDecoder('utf-8');
+    var buf = '';
+
+    function pump() {
+      return reader.read().then(function (res) {
+        if (res.done) return;
+        buf += decoder.decode(res.value, { stream: true });
+
+        var idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          handleEvent(buf.slice(0, idx));
+          buf = buf.slice(idx + 2);
+        }
+        return pump();
+      });
+    }
+    return pump();
+  }
+
+  // ── 主流程 ──────────────────────────────────────────
+
+  function reset() {
+    answerText = '';
+    casesEl.textContent = '';
+    answerEl.textContent = '';
+    casesWrap.hidden = true;
+    answerWrap.hidden = true;
+    copyBtn.textContent = '复制结论';
+    copyBtn.classList.remove('copied');
+  }
+
+  function submit() {
+    if (busy) return;
+
+    var text = q.value.trim();
+    if (!text) { q.focus(); return; }
+
+    busy = true;
+    go.disabled = true;
+    reset();
+    // 精排那一步最慢，先把话说明白，别让人以为是卡死了
+    setStatus('正在检索案例库…（要给每条候选案例打分排序，这一步最慢）', 'busy');
+
+    fetch('/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: text })
+    }).then(function (resp) {
+      if (!resp.ok) throw new Error('服务返回错误：' + resp.status);
+      if (!resp.body) throw new Error('当前浏览器不支持流式读取');
+      return readStream(resp.body);
+
+    }).then(function () {
+      if (statusEl.className.indexOf('error') < 0) setStatus('分析完成。');
+
+    }).catch(function (e) {
+      setStatus('出错了：' + e.message, 'error');
+
+    }).then(function () {
+      busy = false;
+      go.disabled = false;
+    });
+  }
+
+  // ── 示例问题：点一下填进输入框 ──────────────────────
+  // 只填不提交——留给你改成自己的说法，或者先看看会问什么
+
+  Array.prototype.forEach.call(document.querySelectorAll('.chip'), function (chip) {
+    chip.addEventListener('click', function () {
+      q.value = chip.textContent;
+      q.focus();
+    });
+  });
+
+  // ── 复制结论 ────────────────────────────────────────
+
+  copyBtn.addEventListener('click', function () {
+    // 页面显示时把 markdown 的 ** 去掉了，复制出去的也去掉，保持一致
+    var text = answerText.replace(/\*\*/g, '').trim();
+    if (!text) return;
+
+    function done() {
+      copyBtn.textContent = '已复制';
+      copyBtn.classList.add('copied');
+      setTimeout(function () {
+        copyBtn.textContent = '复制结论';
+        copyBtn.classList.remove('copied');
+      }, 1600);
+    }
+
+    // 兜底：老浏览器或非 https 环境下没有剪贴板接口，
+    // 就临时插一个隐藏输入框选中内容，用老办法复制
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); done(); } catch (e) { /* 复制不了就算了 */ }
+      document.body.removeChild(ta);
+    }
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      fallback();
+    }
+  });
+
+  go.addEventListener('click', submit);
+
+  // 在输入框里按 Ctrl+Enter（Mac 上是 Cmd+Enter）也能提交
+  q.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') submit();
+  });
+
+  q.focus();
+})();
+</script>
+</body>
+</html>

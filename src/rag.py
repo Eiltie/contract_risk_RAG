@@ -265,23 +265,23 @@ def rag_search(query: str, top_k: int = 3) -> list[dict]:
     return candidates[:top_k]
 
 
-def generate_answer(query: str, cases: list[dict]) -> str:
-    """最后一步（RAG 的 G）：拿「问题 + 检索到的案例」让大模型写结论。
+def _build_answer_messages(query: str, cases: list[dict]) -> list:
+    """把「用户问题 + 检索到的案例」拼成给大模型的消息列表。
 
     分两种走法：
     - 检索到了案例：把案例（连精排分一起）交给大模型，让它总结成三段结论；
     - 一条都没检索到：换 NO_HIT_PROMPT，要求它如实说"没有案例依据"，
       只给不依赖案例库的通用建议 —— 不然它会用自己脑子里的知识硬凑一段"案例依据"出来。
-    """
-    _ensure_ready()
 
+    为什么单独抽出来：写结论有两条路（一次性返回 / 流式逐字返回），
+    两条路必须用一模一样的提示词，所以拼消息这段共用 —— 以后改提示词只用改这一处。
+    """
     # 无命中：案例库覆盖不到这个问题，宁可说没有，也不能装作有依据
     if not cases:
-        resp = _answer_llm.invoke([
+        return [
             SystemMessage(content=NO_HIT_PROMPT),
             HumanMessage(content=f"用户描述：{query}"),
-        ])
-        return resp.content.strip()
+        ]
 
     parts = []
     for c in cases:
@@ -296,8 +296,34 @@ def generate_answer(query: str, cases: list[dict]) -> str:
     case_text = "\n".join(parts)
 
     user = f"用户描述：{query}\n\n历史相似案例：\n{case_text}"
-    resp = _answer_llm.invoke([
+    return [
         SystemMessage(content=ANSWER_PROMPT),
         HumanMessage(content=user),
-    ])
+    ]
+
+
+def generate_answer(query: str, cases: list[dict]) -> str:
+    """最后一步（RAG 的 G）：拿「问题 + 检索到的案例」让大模型写结论。
+
+    这是「一次性拿完整答案」的版本：命令行版和 /chat 接口用它。
+    invoke 会一直等到整段结论写完才返回。
+    """
+    _ensure_ready()
+
+    resp = _answer_llm.invoke(_build_answer_messages(query, cases))
     return resp.content.strip()
+
+
+def generate_answer_stream(query: str, cases: list[dict]):
+    """同上，但「一边写一边往外吐」（网页的流式接口用它）。
+
+    跟 generate_answer 的区别只有一个：把 invoke 换成 stream。
+    invoke 等整段写完一次性返回；stream 每生成一小块就 yield 一块，
+    调用方拿去立刻发给浏览器，用户就能看着字一个一个往外冒。
+    """
+    _ensure_ready()
+
+    for chunk in _answer_llm.stream(_build_answer_messages(query, cases)):
+        piece = chunk.content
+        if piece:          # 有些分块是空的（只带元信息没有正文），跳过
+            yield piece
