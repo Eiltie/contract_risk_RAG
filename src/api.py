@@ -10,9 +10,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent import retrieve_node
 from built_graph import build_graph
-from rag import generate_answer_stream, init_rag
+from rag import generate_answer_stream, init_rag, rag_search_stream
 
 # 路径：本文件在 src/ 下，上一级才是项目根目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -71,26 +70,28 @@ def _sse(event: str, data) -> str:
 
 @app.post("/chat/stream")
 def chat_stream(req: AskRequest):
-    """流式版：先推检索到的案例，再一个字一个字推生成的结论。
+    """流式版：检索每走一步都实时往外推，最后再一个字一个字推结论。
 
-    为什么要分两段推：
-    检索里的「精排」必须等大模型把整张打分表吐完，程序才能解析、排序、过门槛，
-    所以这一步天生流不了，也是整个请求里最慢的一段。既然躲不掉，
-    就让它别白等——精排一结束就把案例先推给前端，用户马上有东西看，
-    而不是盯着空白干等到结论也写完。
+    后端只负责「如实上报」每一步的进展和结果 —— 页面上先显示谁、怎么排，
+    全部由前端决定（现在是「先结论、后依据」）。想换显示顺序只改前端。
+
+    为什么要有流式：
+    「精排」是整条链里最慢的一段（大模型要给十几二十条候选逐条打分），
+    老做法是等它全跑完才吭声，用户点完按钮只能盯着一片空白。
+    现在改成边走边报 —— 总时长没变，但页面有时间做各种反馈。
+
+    这里不再自己扛分段逻辑，只干一件事：把 rag_search_stream 吐出的事件
+    转成 SSE 格式发给前端。「哪一步报什么」都收在 rag.py 里，跟检索逻辑放一起。
     """
     def gen():
         try:
-            # 第 1 段：检索。
-            # 直接复用图里那个检索节点，这样字段筛选逻辑跟 /chat 完全一致，
-            # 不会出现「流式接口少返回一个字段」这种两边对不上的问题。
-            state = retrieve_node({"question": req.question})
-            cases = json.loads(state["retrieved_cases"])
-            yield _sse("cases", cases)
+            for name, payload in rag_search_stream(req.question, top_k=3):
+                yield _sse(name, payload)
 
-            # 第 2 段：逐字推结论
-            for piece in generate_answer_stream(req.question, cases):
-                yield _sse("token", piece)
+                # 案例一算好就发出去（页面上什么时候画、按什么顺序画，前端说了算）
+                if name == "cases":
+                    for piece in generate_answer_stream(req.question, payload):
+                        yield _sse("token", piece)
 
             yield _sse("done", {})
 

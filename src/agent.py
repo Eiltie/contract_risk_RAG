@@ -1,6 +1,6 @@
 import json
 
-from rag import generate_answer, rag_search
+from rag import generate_answer, rag_search, to_simple_cases
 from state import AgentState
 
 
@@ -10,21 +10,10 @@ def retrieve_node(state: AgentState) -> dict:
 
     cases = rag_search(state["question"], top_k=3)
 
-    # 只保留生成结论需要的几个字段，转成 JSON 字符串存进状态
-    # final_score（精排分）也要留着：生成时要靠它判断这条依据有多硬，前端也靠它显示相关度
-    simple_cases = [
-        {
-            "id": c["id"],
-            "title": c["title"],
-            "risk_type": c["risk_type"],
-            "risk_level": c["risk_level"],
-            "final_score": c.get("final_score"),
-            "analysis": c["analysis"],
-            "suggestion": c["suggestion"],
-        }
-        for c in cases
-    ]
-    return {"retrieved_cases": json.dumps(simple_cases, ensure_ascii=False, indent=2)}
+    # 裁成生成结论需要的几个字段，转成 JSON 字符串存进状态。
+    # 裁剪规则放在 rag.to_simple_cases —— 流式接口走的是同一个函数，
+    # 两边字段必须一致，不然会出现「网页和命令行显示不一样」的问题。
+    return {"retrieved_cases": json.dumps(to_simple_cases(cases), ensure_ascii=False, indent=2)}
 
 
 def generate_node(state: AgentState) -> dict:

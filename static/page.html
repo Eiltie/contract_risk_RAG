@@ -63,6 +63,7 @@
   var busy = false;        // 正在请求中，防重复点击
   var answerText = '';     // 累积模型吐出来的全文
   var renderQueued = false;
+  var pendingCases = null; // 后端推来的案例先存着：等结论写完（done）再画出来
 
   // ⚠️ 安全铁律：下面所有把文字放进页面的地方，一律用 textContent，
   //    绝不拼 innerHTML —— 大模型的输出是外部内容，当 HTML 执行会很危险。
@@ -84,6 +85,11 @@
   }
 
   // ── 案例卡片 ────────────────────────────────────────
+  //
+  // 案例是结论写完才画出来的：后端的 cases 事件先收进 pendingCases 存着，
+  // 等 done（结论写完）再一次性画出来 —— 页面上的顺序就是「先结论、后依据」。
+  // 检索过程中的候选预览、逐条分数本页故意不展示
+  //（后端照常推这些事件，想改回「边检索边显示」只动前端就行）。
 
   function buildCase(c) {
     var card = el('article', 'case');
@@ -95,8 +101,7 @@
     // 相关度 = 精排给这条案例打的分，10 分满分。
     // 做成一小条进度条而不是光写个数字：几分的差距扫一眼就看出来了。
     if (c.final_score !== null && c.final_score !== undefined) {
-      var high = c.final_score >= 8;
-      var wrap = el('span', 'score' + (high ? ' score-high' : ''));
+      var wrap = el('span', 'score' + (c.final_score >= 8 ? ' score-high' : ''));
       wrap.appendChild(el('span', null, '相关度'));   // 样式从 .score 继承，不用单独写
 
       var bar = el('span', 'score-bar');
@@ -135,18 +140,17 @@
   }
 
   function showCases(cases) {
+    casesEl.textContent = '';
     casesWrap.hidden = false;
 
     if (!cases || !cases.length) {
       // 案例库覆盖不到这个问题：如实说清楚，别让人以为下面那段有案例撑着
       casesEl.appendChild(el('p', 'empty',
         '案例库中没有找到相近的案例。下面的结论是通用法律建议，不是案例库的经验总结。'));
-      setStatus('未检索到相近案例，正在生成通用建议…', 'busy');
       return;
     }
 
     cases.forEach(function (c) { casesEl.appendChild(buildCase(c)); });
-    setStatus('已找到 ' + cases.length + ' 条参考案例，正在生成结论…', 'busy');
   }
 
   // ── 结论排版 ────────────────────────────────────────
@@ -205,6 +209,11 @@
   // 服务端按 SSE 格式发：  event: 名字\n data: JSON \n\n
   // （一条消息以空行结尾）。网络分包是随机的，一个事件可能被切成好几块过来，
   // 所以要先攒进 buf，凑够一个完整事件（看到空行）才处理。
+  //
+  // 事件按先后顺序：
+  //   stage（在干嘛）→ candidates / score（检索进度，本页不展示）
+  //   → cases（案例数据，先存着）→ token（结论文本，多条）
+  //   → done（这时候才把案例画出来）
 
   function handleEvent(raw) {
     var name = 'message';
@@ -218,18 +227,30 @@
     var payload;
     try { payload = JSON.parse(data); } catch (e) { payload = null; }
 
-    if (name === 'cases') {
-      showCases(payload);
+    if (name === 'stage') {
+      setStatus(payload, 'busy');       // 后端报到哪一步，直接显示
+
+    } else if (name === 'cases') {
+      // 案例先收下不画 —— 等结论写完（done）再展示，保证「先结论、后依据」。
+      // 检索阶段的 candidates / score 事件这里直接忽略，不往页面上画
+      pendingCases = payload;
 
     } else if (name === 'token') {
-      if (answerWrap.hidden) answerWrap.hidden = false;
+      // 第一个 token 到了，说明结论开始冒字
+      if (answerWrap.hidden) {
+        answerWrap.hidden = false;
+        setStatus('正在生成分析结论…', 'busy');
+      }
       answerText += (typeof payload === 'string' ? payload : '');
       scheduleRender();
+
+    } else if (name === 'done') {
+      // 结论写完了，现在把案例亮出来（整个请求的最后一步）
+      if (pendingCases !== null) showCases(pendingCases);
 
     } else if (name === 'error') {
       setStatus('出错了：' + ((payload && payload.message) || '未知错误'), 'error');
     }
-    // name === 'done' 不用特别处理，收尾在下面的 finally 里
   }
 
   function readStream(body) {
@@ -257,6 +278,7 @@
 
   function reset() {
     answerText = '';
+    pendingCases = null;
     casesEl.textContent = '';
     answerEl.textContent = '';
     casesWrap.hidden = true;
@@ -273,9 +295,10 @@
 
     busy = true;
     go.disabled = true;
+    go.textContent = '分析中…';
     reset();
-    // 精排那一步最慢，先把话说明白，别让人以为是卡死了
-    setStatus('正在检索案例库…（要给每条候选案例打分排序，这一步最慢）', 'busy');
+    // 先垫一句，马上就会被后端的 stage 事件顶掉
+    setStatus('正在检索案例库…', 'busy');
 
     fetch('/chat/stream', {
       method: 'POST',
@@ -295,6 +318,7 @@
     }).then(function () {
       busy = false;
       go.disabled = false;
+      go.textContent = '分析风险';
     });
   }
 

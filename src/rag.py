@@ -196,24 +196,75 @@ def merge_rankings(list_of_results):
     return total
 
 
-def rerank(query: str, candidates: list[dict]) -> list[dict]:
-    """③ 第三层后半：精排。让大模型给候选案例打分，排出最终顺序。"""
+def _pull_scores(text: str, pos: int):
+    """从 text 的 pos 位置往后找完整的 {"id": ..., "score": ...}，抠一条算一条。
+
+    这是给「流式精排」配的小工具。模型还在往外吐的时候，整段文本是不完整的，
+    JSON 随时可能被切在两段之间（比如这一块收到的是 `{"id": "C0`，
+    下一块才是 `12", "score": 8}`），所以没法直接 json.loads 整段，
+    只能一小段一小段地抠：找到一个 { 再找到配对的 }，中间那段拿来试解析。
+
+    返回 (这一轮抠出来的 [(id, 分数), ...], 下次接着扫的位置)。
+    位置必须带出去（不能每块都从头扫），不然同一条分数会被反复上报。
+    """
+    found = []
+    while True:
+        start = text.find("{", pos)
+        if start < 0:            # 后面没有 { 了，下次从末尾接着扫
+            return found, len(text)
+
+        end = text.find("}", start)
+        if end < 0:              # 这个 { 还没等到它配对的 }，先停在这，等后面的内容
+            return found, start
+
+        try:
+            item = json.loads(text[start:end + 1])
+            cid, score = item["id"], float(item["score"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            pos = start + 1      # 不是一条合法分数（比如模型废话里带个 {），跳过继续找
+            continue
+
+        pos = end + 1
+        found.append((cid, score))
+
+
+def rerank_stream(query: str, candidates: list[dict]):
+    """③ 第三层后半：精排（流式版）。跟 rerank 排出来的结果一模一样，只是边打分边往外报。
+
+    每从模型嘴里抠出一条分数，就 yield 一个 (案例id, 分数) 出去 ——
+    调用方拿去立刻推给前端，用户看着分数一条条亮，不用干等十几秒才知道打了什么分。
+
+    函数跑完时，candidates 会被写上 final_score 并排好序（跟 rerank 完全一致）。
+    """
     _ensure_ready()
 
     if len(candidates) <= 1:        # 只有一个候选，没排序意义
         for c in candidates:
             c["final_score"] = None   # 未打分，交给 rag_search 直接返回
-        return candidates
+        return
 
     # 把候选整理成清单给大模型看
     lines = [f"  [{c['id']}] {c['title']}（{c['risk_type']}）" for c in candidates]
     user = f"查询：{query}\n\n候选案例：\n" + "\n".join(lines) + "\n\n请对每个候选案例打分。"
 
-    ans = _rerank_llm.invoke([
+    messages = [
         SystemMessage(content=RERANK_PROMPT),
         HumanMessage(content=user),
-    ])
-    content = ans.content.strip()
+    ]
+
+    # ① 边收边报：模型吐一块，我们抠一块，抠到一条就 yield 一条
+    #    （这一步纯粹是「报进度」，不参与最终结果，抠漏了也没关系）
+    buf = ""
+    pos = 0
+    for chunk in _rerank_llm.stream(messages):
+        buf += chunk.content
+        got, pos = _pull_scores(buf, pos)
+        for cid, score in got:
+            yield cid, score
+
+    # ② 收完了，走原来那套完整解析，拿「权威结果」来排序
+    #    （上面边收边抠的只是给用户看的进度，最终名次以这里为准）
+    content = buf.strip()
 
     # 大模型偶尔把 JSON 包在 ``` 里，先剥掉
     if content.startswith("```"):
@@ -226,21 +277,30 @@ def rerank(query: str, candidates: list[dict]) -> list[dict]:
         for c in candidates:
             c["final_score"] = None
         candidates.sort(key=lambda c: c["merged_score"], reverse=True)
-        return candidates
+        return
 
     for c in candidates:
         c["final_score"] = score_map.get(c["id"], 0.0)
     candidates.sort(key=lambda c: c["final_score"], reverse=True)
+
+
+def rerank(query: str, candidates: list[dict]) -> list[dict]:
+    """精排：让大模型给候选案例打分，排出最终顺序。
+
+    内部就是跑一遍流式版、把中间的分数事件丢掉 ——
+    老接口（rag_search / 命令行 / 评估脚本）不关心过程，等最终结果就行。
+    """
+    for _cid, _score in rerank_stream(query, candidates):
+        pass
     return candidates
 
 
-def rag_search(query: str, top_k: int = 3) -> list[dict]:
-    """RAG 三层检索：关键词 → 语义 → 合并精排，一步走完，返回最终案例列表。
+def _recall(query: str) -> list[dict]:
+    """第 1、2 层 + 第 3 层前半：两路召回 → 合并名次 → 组装候选池。
 
-    这就是给「检索节点」调用的那个 function。
+    只负责「找出候选」，不精排、不截断 —— 精排那一步最慢，
+    单独拎出来是为了让流式接口能先把这批候选报出去，用户不用干等。
     """
-    _ensure_ready()
-
     # 第 1、2 层：两路各自召回（各取前 RECALL_K 条，候选池大一些，精排才有得挑）
     by_keyword = keyword_search(query, top_k=RECALL_K)
     by_semantic = semantic_search(query, top_k=RECALL_K)
@@ -254,15 +314,81 @@ def rag_search(query: str, top_k: int = 3) -> list[dict]:
         c = _by_id[cid].copy()
         c["merged_score"] = round(merged[cid], 6)
         candidates.append(c)
+    return candidates
 
-    # 第 3 层后半：大模型精排
-    candidates = rerank(query, candidates)
 
+def _finalize(candidates: list[dict], top_k: int) -> list[dict]:
+    """精排之后的收尾：过门槛 + 截断成 top_k。两个检索入口共用这一段，保证结果一致。"""
     # 门槛过滤：精排成功后，把弱相关/不相关（分低于门槛）的踢掉，宁缺毋滥
     if candidates and all(c.get("final_score") is not None for c in candidates):
         candidates = [c for c in candidates if c["final_score"] >= MIN_FINAL_SCORE]
 
     return candidates[:top_k]
+
+
+def rag_search(query: str, top_k: int = 3) -> list[dict]:
+    """RAG 三层检索：关键词 → 语义 → 合并精排，一步走完，返回最终案例列表。
+
+    这就是给「检索节点」调用的那个 function。
+    """
+    _ensure_ready()
+
+    candidates = _recall(query)              # 前两层召回 + 第三层前半合并
+    candidates = rerank(query, candidates)   # 第三层后半：精排
+    return _finalize(candidates, top_k)      # 过门槛、截断
+
+
+def rag_search_stream(query: str, top_k: int = 3):
+    """RAG 三层检索（流式版）：跑的东西跟 rag_search 一模一样，区别是「边跑边汇报」。
+
+    每走一步就 yield 一个 (事件名, 数据) 出去，前端拿到就能立刻更新页面：
+
+      ("stage",      "正在…")          —— 当前在干嘛，显示在状态栏
+      ("candidates", [ {id, title, …}]) —— 候选预览：精排还没开始，先把待打分的案例摆出来
+      ("score",      {"id":…, "score":…}) —— 精排每打出一条分数，点亮对应卡片
+      ("cases",      [ … ])             —— 最终案例，内容跟 rag_search 的返回完全一致
+
+    为什么能先报候选：两路召回 + 合并只花不到一秒，候选池这时候就已经定了；
+    慢的是精排，所以先把候选摆出去，让用户在那十几秒里有东西可看。
+    """
+    _ensure_ready()
+
+    yield "stage", "正在检索案例库…"
+    candidates = _recall(query)
+
+    # 候选预览：只报「一会儿要打分的都有谁」，分数还没算出来
+    yield "candidates", [
+        {"id": c["id"], "title": c["title"], "risk_type": c["risk_type"]}
+        for c in candidates
+    ]
+
+    yield "stage", f"正在给 {len(candidates)} 条候选逐条打分排序…"
+    for cid, score in rerank_stream(query, candidates):
+        yield "score", {"id": cid, "score": score}
+
+    yield "cases", to_simple_cases(_finalize(candidates, top_k))
+
+
+def to_simple_cases(cases: list[dict]) -> list[dict]:
+    """把检索结果裁成「生成结论 + 前端展示」用得着的那几个字段。
+
+    为什么单独抽出来：流式接口和老接口都要裁，
+    共用这一处才能保证两边裁得一模一样，不会出现「网页少显示一个字段」这种对不上的问题。
+
+    final_score（精排分）要留着：生成时要靠它判断这条依据有多硬，前端也靠它显示相关度。
+    """
+    return [
+        {
+            "id": c["id"],
+            "title": c["title"],
+            "risk_type": c["risk_type"],
+            "risk_level": c["risk_level"],
+            "final_score": c.get("final_score"),
+            "analysis": c["analysis"],
+            "suggestion": c["suggestion"],
+        }
+        for c in cases
+    ]
 
 
 def _build_answer_messages(query: str, cases: list[dict]) -> list:
