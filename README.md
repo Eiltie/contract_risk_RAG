@@ -68,7 +68,8 @@
 │   ├── risk_cases/cases.json   # 案例库（40 条）
 │   ├── eval/questions.json     # 评估集（60 道题，给 eval.py 判卷用）
 │   └── chroma_db/              # 向量库（首次运行自动生成）
-├── requirements.txt       # 依赖
+├── package/
+│   └── requirements.txt   # 依赖
 ├── .env                   # 密钥配置（需自行填写，见下文）
 └── README.md
 ```
@@ -90,7 +91,7 @@ python -m venv venv
 venv\Scripts\activate
 
 # 安装依赖
-pip install -r requirements.txt
+pip install -r package\requirements.txt
 ```
 
 ### 3. 配置 .env
